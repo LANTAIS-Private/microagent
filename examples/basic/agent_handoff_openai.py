@@ -1,3 +1,5 @@
+# This is an example script demonstrating agent handoff using OpenAI LLM
+
 from microagent import Microagent, Agent
 from microagent.repl import run_demo_loop
 

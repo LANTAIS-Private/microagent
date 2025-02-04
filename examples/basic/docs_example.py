@@ -1,3 +1,5 @@
+# This is an example script demonstrating the usage of the microagent framework
+
 from microagent import Microagent, Agent
 
 client = Microagent(llm_type='openai')

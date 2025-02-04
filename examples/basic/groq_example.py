@@ -1,3 +1,5 @@
+# This is an example script demonstrating the usage of the microagent framework with Groq LLM
+
 import os
 from microagent.core import Microagent
 from microagent.types import Agent

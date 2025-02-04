@@ -23,7 +23,16 @@ Microagent focuses on providing a simple yet powerful interface for creating and
 ## Installation
 
 ```shell
-pip install git+https://github.com/chrislatimer/microagent.git
+pip install -r requirements.txt
+```
+
+## Cloning the Repository
+
+To clone the repository to your local machine, use the following commands:
+
+```shell
+git clone https://github.com/chrislatimer/microagent.git
+cd microagent
 ```
 
 ## Quick Start
