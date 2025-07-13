@@ -1,4 +1,4 @@
-name: Sync Fork with Upstream
+name: Sync Fork with Upstream (Enhanced)
 on:
   schedule:
     - cron: '0 6 * * *'  # Daily at 6 AM UTC
@@ -7,13 +7,14 @@ on:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    if: github.event.repository.fork == true
+    # Remove fork check - let it run on any repo and handle errors gracefully
     
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # Use PAT if available, fallback to GITHUB_TOKEN
+          token: ${{ secrets.SYNC_PAT || secrets.GITHUB_TOKEN }}
           fetch-depth: 0
           
       - name: Setup Git
@@ -21,29 +22,140 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
-      - name: Add upstream remote
+      - name: Check if repository is a fork
+        id: fork_check
         run: |
-          git remote add upstream ${{ github.event.repository.parent.clone_url }}
-          git remote -v
+          # Use GitHub API to check if repo is a fork
+          REPO_INFO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}")
+          
+          IS_FORK=$(echo "$REPO_INFO" | jq -r '.fork // false')
+          PARENT_URL=$(echo "$REPO_INFO" | jq -r '.parent.clone_url // "none"')
+          
+          echo "is_fork=$IS_FORK" >> $GITHUB_OUTPUT
+          echo "parent_url=$PARENT_URL" >> $GITHUB_OUTPUT
+          
+          echo "Repository fork status: $IS_FORK"
+          echo "Parent URL: $PARENT_URL"
+          
+      - name: Add upstream remote
+        if: steps.fork_check.outputs.is_fork == 'true'
+        run: |
+          UPSTREAM_URL="${{ steps.fork_check.outputs.parent_url }}"
+          
+          if [ "$UPSTREAM_URL" != "none" ]; then
+            git remote add upstream "$UPSTREAM_URL"
+            git remote -v
+            echo "Added upstream: $UPSTREAM_URL"
+          else
+            echo "No parent URL found, exiting"
+            exit 1
+          fi
           
       - name: Fetch upstream
-        run: git fetch upstream
-        
-      - name: Sync main branch
+        if: steps.fork_check.outputs.is_fork == 'true'
         run: |
-          git checkout main
-          git merge upstream/main --no-edit
-          git push origin main
+          echo "Fetching from upstream..."
+          git fetch upstream --prune
+          git remote show upstream
+          
+      - name: Determine default branch
+        if: steps.fork_check.outputs.is_fork == 'true'
+        id: branch_check
+        run: |
+          # Get the default branch from upstream
+          DEFAULT_BRANCH=$(git remote show upstream | grep 'HEAD branch' | cut -d' ' -f5)
+          if [ -z "$DEFAULT_BRANCH" ]; then
+            # Fallback: check common branch names
+            if git show-ref --verify --quiet refs/remotes/upstream/main; then
+              DEFAULT_BRANCH="main"
+            elif git show-ref --verify --quiet refs/remotes/upstream/master; then
+              DEFAULT_BRANCH="master"
+            else
+              DEFAULT_BRANCH="main"  # Final fallback
+            fi
+          fi
+          
+          echo "default_branch=$DEFAULT_BRANCH" >> $GITHUB_OUTPUT
+          echo "Default branch detected: $DEFAULT_BRANCH"
+          
+      - name: Sync default branch
+        if: steps.fork_check.outputs.is_fork == 'true'
+        run: |
+          DEFAULT_BRANCH="${{ steps.branch_check.outputs.default_branch }}"
+          
+          echo "Syncing branch: $DEFAULT_BRANCH"
+          
+          # Check if local branch exists
+          if git show-ref --verify --quiet refs/heads/$DEFAULT_BRANCH; then
+            git checkout $DEFAULT_BRANCH
+          else
+            git checkout -b $DEFAULT_BRANCH upstream/$DEFAULT_BRANCH
+          fi
+          
+          # Check if there are any differences
+          if git diff --quiet HEAD upstream/$DEFAULT_BRANCH; then
+            echo "No changes to sync for $DEFAULT_BRANCH"
+          else
+            echo "Syncing changes for $DEFAULT_BRANCH"
+            git merge upstream/$DEFAULT_BRANCH --no-edit --strategy-option=theirs
+            git push origin $DEFAULT_BRANCH
+            echo "Successfully synced $DEFAULT_BRANCH"
+          fi
         continue-on-error: true
         
-      - name: Sync other branches (optional)
+      - name: Sync additional branches (limited)
+        if: steps.fork_check.outputs.is_fork == 'true'
         run: |
-          for branch in $(git branch -r --format='%(refname:short)' | grep '^upstream/' | grep -v 'upstream/HEAD' | sed 's/upstream\///'); do
+          echo "Checking for additional branches to sync..."
+          
+          # Get list of upstream branches (limit to 5 to avoid timeout)
+          UPSTREAM_BRANCHES=$(git branch -r --format='%(refname:short)' | grep '^upstream/' | grep -v 'upstream/HEAD' | sed 's/upstream\///' | head -5)
+          
+          for branch in $UPSTREAM_BRANCHES; do
+            # Skip the default branch (already synced)
+            if [ "$branch" = "${{ steps.branch_check.outputs.default_branch }}" ]; then
+              continue
+            fi
+            
+            echo "Processing branch: $branch"
+            
+            # Check if we have this branch locally
             if git show-ref --verify --quiet refs/remotes/origin/$branch; then
-              echo "Syncing branch: $branch"
+              echo "Syncing existing branch: $branch"
               git checkout $branch 2>/dev/null || git checkout -b $branch upstream/$branch
-              git merge upstream/$branch --no-edit || echo "Merge conflict in $branch, skipping"
-              git push origin $branch || echo "Push failed for $branch, skipping"
+              
+              # Check for conflicts before merging
+              if git merge-tree $(git merge-base HEAD upstream/$branch) HEAD upstream/$branch | grep -q "^@@"; then
+                echo "Merge conflict detected in $branch, skipping"
+                continue
+              fi
+              
+              git merge upstream/$branch --no-edit || {
+                echo "Merge failed for $branch, skipping"
+                git merge --abort 2>/dev/null || true
+                continue
+              }
+              
+              git push origin $branch || echo "Push failed for $branch"
+            else
+              echo "Branch $branch not found in origin, skipping"
             fi
           done
         continue-on-error: true
+        
+      - name: Summary
+        if: steps.fork_check.outputs.is_fork == 'true'
+        run: |
+          echo "=== Sync Summary ==="
+          echo "Repository: ${{ github.repository }}"
+          echo "Fork status: ${{ steps.fork_check.outputs.is_fork }}"
+          echo "Upstream: ${{ steps.fork_check.outputs.parent_url }}"
+          echo "Default branch: ${{ steps.branch_check.outputs.default_branch }}"
+          echo "Sync completed"
+          
+      - name: Not a fork
+        if: steps.fork_check.outputs.is_fork != 'true'
+        run: |
+          echo "This repository is not a fork. Skipping sync."
+          echo "Repository: ${{ github.repository }}"
